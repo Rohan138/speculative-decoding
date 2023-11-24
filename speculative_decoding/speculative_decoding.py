@@ -1,49 +1,55 @@
 import math
-
-import torch
-from torch.nn import Module, ModuleList
-from torch import nn, einsum, Tensor
-import torch.nn.functional as F
-
-from rotary_embedding_torch import RotaryEmbedding
-from beartype import beartype
-
 from collections import namedtuple
 
+import torch
+import torch.nn.functional as F
+from beartype import beartype
 from einops import rearrange
+from rotary_embedding_torch import RotaryEmbedding
+from torch import Tensor, einsum, nn
+from torch.nn import Module, ModuleList
 
 # constants
 
-Cache = namedtuple('Cache', ['cached_kvs', 'embeds'])
+Cache = namedtuple("Cache", ["cached_kvs", "embeds"])
 
 # helper functions
+
 
 def exists(val):
     return val is not None
 
+
 def default(val, d):
     return val if exists(val) else d
 
+
 # sampling helpers
 
-def log(t, eps = 1e-20):
-    return torch.log(t.clamp(min = eps))
+
+def log(t, eps=1e-20):
+    return torch.log(t.clamp(min=eps))
+
 
 def gumbel_noise(t):
     noise = torch.zeros_like(t).uniform_(0, 1)
     return -log(-log(noise))
 
-def gumbel_sample(t, temperature = 1., dim = -1):
-    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim)
 
-def top_k(logits, thres = 0.9):
+def gumbel_sample(t, temperature=1.0, dim=-1):
+    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim=dim)
+
+
+def top_k(logits, thres=0.9):
     k = math.ceil((1 - thres) * logits.shape[-1])
     val, ind = torch.topk(logits, k)
-    probs = torch.full_like(logits, float('-inf'))
+    probs = torch.full_like(logits, float("-inf"))
     probs.scatter_(-1, ind, val)
     return probs
 
+
 # rotary embeddings
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim):
@@ -52,29 +58,33 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, seq_len):
-        t = torch.arange(seq_len, device = self.inv_freq.device).type_as(self.inv_freq)
-        freqs = einsum('i, j -> i j', t, self.inv_freq)
-        freqs = torch.cat((freqs, freqs), dim = -1)
+        t = torch.arange(seq_len, device=self.inv_freq.device).type_as(self.inv_freq)
+        freqs = einsum("i, j -> i j", t, self.inv_freq)
+        freqs = torch.cat((freqs, freqs), dim=-1)
         return freqs
+
 
 def rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
+
 
 def apply_rotary_pos_emb(pos, t):
     seq_len = t.shape[-2]
     pos = pos[-seq_len:, :]
     return t * pos.cos() + rotate_half(t) * pos.sin()
 
+
 # different decoding strategies
+
 
 @torch.no_grad()
 def base_decoding(
     net: Module,
     prompt: Tensor,
     seq_len: int,
-    temperature = 1.,
-    filter_thres = 0.9,
+    temperature=1.0,
+    filter_thres=0.9,
 ):
     prompt_seq_len, out = prompt.shape[-1], prompt.clone()
     sample_num_times = max(0, seq_len - prompt_seq_len)
@@ -82,23 +92,27 @@ def base_decoding(
     cache = None
 
     for _ in range(sample_num_times):
-        logits, cache = net(out, cache = cache, return_cache = True)
+        logits, cache = net(out, cache=cache, return_cache=True)
         logits = logits[:, -1]
 
-        logits = top_k(logits, thres = filter_thres)
-        sample = gumbel_sample(logits, temperature = temperature, dim = -1)
+        logits = top_k(logits, thres=filter_thres)
+        sample = gumbel_sample(logits, temperature=temperature, dim=-1)
 
-        out = torch.cat((out, sample[..., None]), dim = -1)
+        out = torch.cat((out, sample[..., None]), dim=-1)
 
     return out[..., prompt_seq_len:]
 
+
 # speculative decoding functions
 
-def safe_div(num, den, eps = 1e-10):
+
+def safe_div(num, den, eps=1e-10):
     return num / max(den, eps)
 
-def find_first_true_index(bool_tensor, dim = -1):
-    return (bool_tensor.cumsum(dim = dim) == 0).sum(dim = dim)
+
+def find_first_true_index(bool_tensor, dim=-1):
+    return (bool_tensor.cumsum(dim=dim) == 0).sum(dim=dim)
+
 
 @torch.no_grad()
 def speculative_decoding(
@@ -107,10 +121,10 @@ def speculative_decoding(
     prompt: Tensor,
     seq_len: int,
     gamma: int = 5,
-    temperature = 1.,
-    filter_thres = 0.9,
-    lenience = 1.,
-    pad_id = 0
+    temperature=1.0,
+    filter_thres=0.9,
+    lenience=1.0,
+    pad_id=0,
 ):
     """
     eq. algorithm 1 in paper https://arxiv.org/abs/2211.17192
@@ -125,11 +139,10 @@ def speculative_decoding(
     num_steps = 0
     total_accepted = 0
 
-    batch_range = torch.arange(batch, device = device, dtype = torch.long)[..., None]
-    seq_lens = torch.full((batch,), prompt_seq_len, device = device, dtype = torch.long)
+    batch_range = torch.arange(batch, device=device, dtype=torch.long)[..., None]
+    seq_lens = torch.full((batch,), prompt_seq_len, device=device, dtype=torch.long)
 
     while (seq_lens < seq_len).any():
-
         # predict with smaller network
 
         all_small_logits = []
@@ -138,48 +151,45 @@ def speculative_decoding(
         for _ in range(gamma):
             small_logits, small_cache = small_net(
                 out,
-                seq_start_pos = out.shape[-1] - seq_lens,
-                cache = small_cache,
-                return_cache = True
+                seq_start_pos=out.shape[-1] - seq_lens,
+                cache=small_cache,
+                return_cache=True,
             )
 
             small_logits = small_logits[:, -1]
 
-            small_logits = top_k(small_logits, thres = filter_thres)
+            small_logits = top_k(small_logits, thres=filter_thres)
             all_small_logits.append(small_logits)
 
-            sample = gumbel_sample(small_logits, temperature = temperature, dim = -1)
-            out = torch.cat((out, sample[..., None]), dim = -1)
+            sample = gumbel_sample(small_logits, temperature=temperature, dim=-1)
+            out = torch.cat((out, sample[..., None]), dim=-1)
             seq_lens += 1
 
-            q_sampled_out.append(rearrange(sample, 'b -> b 1 1'))
+            q_sampled_out.append(rearrange(sample, "b -> b 1 1"))
 
-        q_sampled_out = torch.cat(q_sampled_out, dim = -2)
-        small_logits = torch.stack(all_small_logits, dim = -2)
+        q_sampled_out = torch.cat(q_sampled_out, dim=-2)
+        small_logits = torch.stack(all_small_logits, dim=-2)
 
         # verify with larger network
 
         logits, cache = net(
-            out,
-            seq_start_pos = out.shape[-1] - seq_lens,
-            cache = cache,
-            return_cache = True
+            out, seq_start_pos=out.shape[-1] - seq_lens, cache=cache, return_cache=True
         )
 
-        logits = logits[..., -(gamma + 1):, :]
-        logits = top_k(logits, thres = filter_thres)
+        logits = logits[..., -(gamma + 1) :, :]
+        logits = top_k(logits, thres=filter_thres)
 
         # prob and prob of small model (p(x) and q(x) in algorithm 1)
 
-        prob = safe_div(logits, temperature).softmax(dim = -1)
-        small_prob = safe_div(small_logits, temperature).softmax(dim = -1)
+        prob = safe_div(logits, temperature).softmax(dim=-1)
+        small_prob = safe_div(small_logits, temperature).softmax(dim=-1)
 
         p, prob_next = prob[:, :-1], prob[:, -1]
 
         p = p.gather(-1, q_sampled_out)
         q = small_prob.gather(-1, q_sampled_out) * lenience
 
-        p, q = [rearrange(t, 'b n 1 -> b n') for t in (p, q)]
+        p, q = [rearrange(t, "b n 1 -> b n") for t in (p, q)]
 
         r = random_uniform = torch.zeros_like(q).float().uniform_(0, 1)
 
@@ -191,42 +201,50 @@ def speculative_decoding(
         num_rejected = gamma - accepted
         has_rejected = num_rejected > 0
 
-        accepted = rearrange(accepted, 'b -> b 1')
-        accepted.clamp_(max = gamma - 1)
-        adjusted_prob = F.relu(prob[batch_range, accepted] - small_prob[batch_range, accepted])
-        adjusted_prob = adjusted_prob / adjusted_prob.sum(dim = -1, keepdim = True)
-        adjusted_prob = rearrange(adjusted_prob, 'b 1 d -> b d')
+        accepted = rearrange(accepted, "b -> b 1")
+        accepted.clamp_(max=gamma - 1)
+        adjusted_prob = F.relu(
+            prob[batch_range, accepted] - small_prob[batch_range, accepted]
+        )
+        adjusted_prob = adjusted_prob / adjusted_prob.sum(dim=-1, keepdim=True)
+        adjusted_prob = rearrange(adjusted_prob, "b 1 d -> b d")
 
         prob_next = torch.where(
-            rearrange(has_rejected, '... -> ... 1'),
-            adjusted_prob,
-            prob_next
+            rearrange(has_rejected, "... -> ... 1"), adjusted_prob, prob_next
         )
 
         # do a bunch of slicing and align everything to the right, including kv caches
 
         max_num_rejected = num_rejected.amax()
-        seq_arange = torch.arange(out.shape[-1], device = device, dtype = torch.long)
+        seq_arange = torch.arange(out.shape[-1], device=device, dtype=torch.long)
         seq_offset_indices = seq_arange + (max_num_rejected - num_rejected)[..., None]
 
         seq_lens -= num_rejected
         max_seq_len = seq_lens.amax()
 
         if batch > 1:
-            out = F.pad(out, (0, max_num_rejected), value = pad_id)
+            out = F.pad(out, (0, max_num_rejected), value=pad_id)
             out = out[batch_range, seq_offset_indices]
 
-            cache = tuple(F.pad(t, (0, 0, 0, max_num_rejected), value = pad_id) for t in cache)
-            small_cache = tuple(F.pad(t, (0, 0, 0, max_num_rejected), value = pad_id) for t in small_cache)
+            cache = tuple(
+                F.pad(t, (0, 0, 0, max_num_rejected), value=pad_id) for t in cache
+            )
+            small_cache = tuple(
+                F.pad(t, (0, 0, 0, max_num_rejected), value=pad_id) for t in small_cache
+            )
 
-            cache = tuple(rearrange(t, 'b ... n d -> b n ... d') for t in cache)
-            small_cache = tuple(rearrange(t, 'b ... n d -> b n ... d') for t in small_cache)
+            cache = tuple(rearrange(t, "b ... n d -> b n ... d") for t in cache)
+            small_cache = tuple(
+                rearrange(t, "b ... n d -> b n ... d") for t in small_cache
+            )
 
             cache = tuple(t[batch_range, seq_offset_indices] for t in cache)
             small_cache = tuple(t[batch_range, seq_offset_indices] for t in small_cache)
 
-            cache = tuple(rearrange(t, 'b n ... d -> b ... n d') for t in cache)
-            small_cache = tuple(rearrange(t, 'b n ... d -> b ... n d') for t in small_cache)
+            cache = tuple(rearrange(t, "b n ... d -> b ... n d") for t in cache)
+            small_cache = tuple(
+                rearrange(t, "b n ... d -> b ... n d") for t in small_cache
+            )
 
             if out.shape[-1] > max_seq_len:
                 left_index = out.shape[-1] - max_seq_len
@@ -238,19 +256,20 @@ def speculative_decoding(
 
         next_token = torch.multinomial(prob_next, 1)
 
-        out = torch.cat((out, next_token), dim = -1)
+        out = torch.cat((out, next_token), dim=-1)
         seq_lens += 1
 
     # now left align
 
     num_pad_left = out.shape[-1] - seq_lens
     max_pad_left = num_pad_left.amax()
-    out = F.pad(out, (0, max_pad_left), value = pad_id)
+    out = F.pad(out, (0, max_pad_left), value=pad_id)
 
-    seq_len_range = torch.arange(seq_len, device = device, dtype = torch.long)
+    seq_len_range = torch.arange(seq_len, device=device, dtype=torch.long)
     out = out[batch_range, seq_len_range + num_pad_left[..., None]]
 
     return out[..., prompt_seq_len:], total_accepted / num_steps
+
 
 @torch.no_grad()
 def speculative_decoding_with_same_model(
@@ -258,10 +277,10 @@ def speculative_decoding_with_same_model(
     prompt: Tensor,
     seq_len: int,
     gamma: int = 5,
-    temperature = 1.,
-    filter_thres = 0.9,
-    lenience = 1.,
-    pad_id = 0
+    temperature=1.0,
+    filter_thres=0.9,
+    lenience=1.0,
+    pad_id=0,
 ):
     """
     eq. algorithm 1 in paper https://arxiv.org/abs/2211.17192
@@ -276,11 +295,10 @@ def speculative_decoding_with_same_model(
     num_steps = 0
     total_accepted = 0
 
-    batch_range = torch.arange(batch, device = device, dtype = torch.long)[..., None]
-    seq_lens = torch.full((batch,), prompt_seq_len, device = device, dtype = torch.long)
+    batch_range = torch.arange(batch, device=device, dtype=torch.long)[..., None]
+    seq_lens = torch.full((batch,), prompt_seq_len, device=device, dtype=torch.long)
 
     while (seq_lens < seq_len).any():
-
         # predict with smaller network
 
         all_small_logits = []
@@ -289,51 +307,51 @@ def speculative_decoding_with_same_model(
         for _ in range(gamma):
             small_logits, small_cache = net(
                 out,
-                cache = small_cache,
-                return_cache = True,
-                return_early_exit_only = True,
-                seq_start_pos = out.shape[-1] - seq_lens
+                cache=small_cache,
+                return_cache=True,
+                return_early_exit_only=True,
+                seq_start_pos=out.shape[-1] - seq_lens,
             )
 
             small_logits = small_logits[:, -1]
 
-            small_logits = top_k(small_logits, thres = filter_thres)
+            small_logits = top_k(small_logits, thres=filter_thres)
             all_small_logits.append(small_logits)
 
-            sample = gumbel_sample(small_logits, temperature = temperature, dim = -1)
-            out = torch.cat((out, sample[..., None]), dim = -1)
+            sample = gumbel_sample(small_logits, temperature=temperature, dim=-1)
+            out = torch.cat((out, sample[..., None]), dim=-1)
             seq_lens += 1
 
-            q_sampled_out.append(rearrange(sample, 'b -> b 1 1'))
+            q_sampled_out.append(rearrange(sample, "b -> b 1 1"))
 
-        q_sampled_out = torch.cat(q_sampled_out, dim = -2)
-        small_logits = torch.stack(all_small_logits, dim = -2)
+        q_sampled_out = torch.cat(q_sampled_out, dim=-2)
+        small_logits = torch.stack(all_small_logits, dim=-2)
 
         # verify with larger network
 
         logits, cache = net(
             out,
-            cache = cache,
-            early_exit_cache = small_cache,
-            return_cache = True,
-            start_from_early_exit_hiddens = True,
-            seq_start_pos = out.shape[-1] - seq_lens
+            cache=cache,
+            early_exit_cache=small_cache,
+            return_cache=True,
+            start_from_early_exit_hiddens=True,
+            seq_start_pos=out.shape[-1] - seq_lens,
         )
 
-        logits = logits[..., -(gamma + 1):, :]
-        logits = top_k(logits, thres = filter_thres)
+        logits = logits[..., -(gamma + 1) :, :]
+        logits = top_k(logits, thres=filter_thres)
 
         # prob and prob of small model (p(x) and q(x) in algorithm 1)
 
-        prob = safe_div(logits, temperature).softmax(dim = -1)
-        small_prob = safe_div(small_logits, temperature).softmax(dim = -1)
+        prob = safe_div(logits, temperature).softmax(dim=-1)
+        small_prob = safe_div(small_logits, temperature).softmax(dim=-1)
 
         p, prob_next = prob[:, :-1], prob[:, -1]
 
         p = p.gather(-1, q_sampled_out)
         q = small_prob.gather(-1, q_sampled_out) * lenience
 
-        p, q = [rearrange(t, 'b n 1 -> b n') for t in (p, q)]
+        p, q = [rearrange(t, "b n 1 -> b n") for t in (p, q)]
 
         r = random_uniform = torch.zeros_like(q).float().uniform_(0, 1)
 
@@ -345,43 +363,51 @@ def speculative_decoding_with_same_model(
         num_rejected = gamma - accepted
         has_rejected = num_rejected > 0
 
-        accepted = rearrange(accepted, 'b -> b 1')
-        accepted.clamp_(max = gamma - 1)
+        accepted = rearrange(accepted, "b -> b 1")
+        accepted.clamp_(max=gamma - 1)
 
-        adjusted_prob = F.relu(prob[batch_range, accepted] - small_prob[batch_range, accepted])
-        adjusted_prob = adjusted_prob / adjusted_prob.sum(dim = -1, keepdim = True)
-        adjusted_prob = rearrange(adjusted_prob, 'b 1 d -> b d')
+        adjusted_prob = F.relu(
+            prob[batch_range, accepted] - small_prob[batch_range, accepted]
+        )
+        adjusted_prob = adjusted_prob / adjusted_prob.sum(dim=-1, keepdim=True)
+        adjusted_prob = rearrange(adjusted_prob, "b 1 d -> b d")
 
         prob_next = torch.where(
-            rearrange(has_rejected, '... -> ... 1'),
-            adjusted_prob,
-            prob_next
+            rearrange(has_rejected, "... -> ... 1"), adjusted_prob, prob_next
         )
 
         # do a bunch of slicing and align everything to the right, including kv caches
 
         max_num_rejected = num_rejected.amax()
-        seq_arange = torch.arange(out.shape[-1], device = device, dtype = torch.long)
+        seq_arange = torch.arange(out.shape[-1], device=device, dtype=torch.long)
         seq_offset_indices = seq_arange + (max_num_rejected - num_rejected)[..., None]
 
         seq_lens -= num_rejected
         max_seq_len = seq_lens.amax()
 
         if batch > 1:
-            out = F.pad(out, (0, max_num_rejected), value = pad_id)
+            out = F.pad(out, (0, max_num_rejected), value=pad_id)
             out = out[batch_range, seq_offset_indices]
 
-            cache = tuple(F.pad(t, (0, 0, 0, max_num_rejected), value = pad_id) for t in cache)
-            small_cache = tuple(F.pad(t, (0, 0, 0, max_num_rejected), value = pad_id) for t in small_cache)
+            cache = tuple(
+                F.pad(t, (0, 0, 0, max_num_rejected), value=pad_id) for t in cache
+            )
+            small_cache = tuple(
+                F.pad(t, (0, 0, 0, max_num_rejected), value=pad_id) for t in small_cache
+            )
 
-            cache = tuple(rearrange(t, 'b ... n d -> b n ... d') for t in cache)
-            small_cache = tuple(rearrange(t, 'b ... n d -> b n ... d') for t in small_cache)
+            cache = tuple(rearrange(t, "b ... n d -> b n ... d") for t in cache)
+            small_cache = tuple(
+                rearrange(t, "b ... n d -> b n ... d") for t in small_cache
+            )
 
             cache = tuple(t[batch_range, seq_offset_indices] for t in cache)
             small_cache = tuple(t[batch_range, seq_offset_indices] for t in small_cache)
 
-            cache = tuple(rearrange(t, 'b n ... d -> b ... n d') for t in cache)
-            small_cache = tuple(rearrange(t, 'b n ... d -> b ... n d') for t in small_cache)
+            cache = tuple(rearrange(t, "b n ... d -> b ... n d") for t in cache)
+            small_cache = tuple(
+                rearrange(t, "b n ... d -> b ... n d") for t in small_cache
+            )
 
             if out.shape[-1] > max_seq_len:
                 left_index = out.shape[-1] - max_seq_len
@@ -393,105 +419,105 @@ def speculative_decoding_with_same_model(
 
         next_token = torch.multinomial(prob_next, 1)
 
-        out = torch.cat((out, next_token), dim = -1)
+        out = torch.cat((out, next_token), dim=-1)
         seq_lens += 1
 
     # now left align
 
     num_pad_left = out.shape[-1] - seq_lens
     max_pad_left = num_pad_left.amax()
-    out = F.pad(out, (0, max_pad_left), value = pad_id)
+    out = F.pad(out, (0, max_pad_left), value=pad_id)
 
-    seq_len_range = torch.arange(seq_len, device = device, dtype = torch.long)
+    seq_len_range = torch.arange(seq_len, device=device, dtype=torch.long)
     out = out[batch_range, seq_len_range + num_pad_left[..., None]]
 
     return out[..., prompt_seq_len:], total_accepted / num_steps
 
+
 # norm
+
 
 class RMSNorm(Module):
     def __init__(self, dim):
         super().__init__()
-        self.scale = dim ** 0.5
+        self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.normalize(x, dim = -1) * self.scale * self.gamma
+        return F.normalize(x, dim=-1) * self.scale * self.gamma
+
 
 # attention and feedforward
+
 
 class CausalAttention(Module):
     def __init__(
         self,
         dim,
         *,
-        dim_head = 64,
-        heads = 8,
+        dim_head=64,
+        heads=8,
     ):
         super().__init__()
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
         dim_inner = dim_head * heads
 
         self.norm = RMSNorm(dim)
 
-        self.to_qkv = nn.Linear(dim, dim_inner * 3, bias = False)
-        self.to_out = nn.Linear(dim_inner, dim, bias = False)
+        self.to_qkv = nn.Linear(dim, dim_inner * 3, bias=False)
+        self.to_out = nn.Linear(dim_inner, dim, bias=False)
 
-    def forward(
-        self,
-        x,
-        cache = None,
-        context_mask = None,
-        rotary_emb = None
-    ):
+    def forward(self, x, cache=None, context_mask=None, rotary_emb=None):
         h, device = self.heads, x.device
 
         x = self.norm(x)
 
-        q, k, v = rearrange(self.to_qkv(x), 'b n (qkv h d) -> qkv b h n d', qkv = 3, h = h)
+        q, k, v = rearrange(self.to_qkv(x), "b n (qkv h d) -> qkv b h n d", qkv=3, h=h)
 
         if exists(cache):
-            ck, cv = cache.unbind(dim = 1)
-            k = torch.cat((ck, k), dim = -2)
-            v = torch.cat((cv, v), dim = -2)
+            ck, cv = cache.unbind(dim=1)
+            k = torch.cat((ck, k), dim=-2)
+            v = torch.cat((cv, v), dim=-2)
 
-        cached_kv = torch.stack((k, v), dim = 1)
+        cached_kv = torch.stack((k, v), dim=1)
 
         if exists(rotary_emb):
             q = apply_rotary_pos_emb(rotary_emb, q)
             k = apply_rotary_pos_emb(rotary_emb, k)
 
-        sim = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        sim = einsum("b h i d, b h j d -> b h i j", q, k) * self.scale
 
         i, j = sim.shape[-2:]
-        causal_mask = torch.ones((i, j), device = device, dtype = torch.bool).triu(j - i + 1)
+        causal_mask = torch.ones((i, j), device=device, dtype=torch.bool).triu(
+            j - i + 1
+        )
 
         sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         if exists(context_mask):
-            context_mask = rearrange(context_mask, 'b j -> b 1 1 j')
+            context_mask = rearrange(context_mask, "b j -> b 1 1 j")
             sim = sim.masked_fill(~context_mask, -torch.finfo(sim.dtype).max)
 
-        attn = sim.softmax(dim = -1)
+        attn = sim.softmax(dim=-1)
 
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = einsum("b h i j, b h j d -> b h i d", attn, v)
 
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = rearrange(out, "b h n d -> b n (h d)")
         out = self.to_out(out)
 
         return out, cached_kv
 
-def FeedForward(dim, mult = 4):
+
+def FeedForward(dim, mult=4):
     dim_inner = dim * mult
     return nn.Sequential(
-        RMSNorm(dim),
-        nn.Linear(dim, dim_inner),
-        nn.GELU(),
-        nn.Linear(dim_inner, dim)
+        RMSNorm(dim), nn.Linear(dim, dim_inner), nn.GELU(), nn.Linear(dim_inner, dim)
     )
 
+
 # main class
+
 
 class Decoder(Module):
     def __init__(
@@ -500,30 +526,33 @@ class Decoder(Module):
         num_tokens,
         dim,
         depth,
-        heads = 8,
-        dim_head = 64,
-        ff_mult = 4,
-        ignore_index = -1,
-        early_exit_layer = None,
-        early_exit_extra_transformer_blocks = 0,
-        detach_early_exit_hiddens = False
+        heads=8,
+        dim_head=64,
+        ff_mult=4,
+        ignore_index=-1,
+        early_exit_layer=None,
+        early_exit_extra_transformer_blocks=0,
+        detach_early_exit_hiddens=False,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(num_tokens, dim)
 
         self.layers = ModuleList([])
 
-        self.rotary_emb = RotaryEmbedding(dim = dim_head)
+        self.rotary_emb = RotaryEmbedding(dim=dim_head)
 
         for _ in range(depth):
-            self.layers.append(ModuleList([
-                CausalAttention(dim = dim, dim_head = dim_head, heads = heads),
-                FeedForward(dim = dim, mult = ff_mult)
-            ]))
+            self.layers.append(
+                ModuleList(
+                    [
+                        CausalAttention(dim=dim, dim_head=dim_head, heads=heads),
+                        FeedForward(dim=dim, mult=ff_mult),
+                    ]
+                )
+            )
 
         self.to_logits = nn.Sequential(
-            RMSNorm(dim),
-            nn.Linear(dim, num_tokens, bias = False)
+            RMSNorm(dim), nn.Linear(dim, num_tokens, bias=False)
         )
 
         self.detach_early_exit_hiddens = detach_early_exit_hiddens
@@ -533,14 +562,22 @@ class Decoder(Module):
 
         if exists(early_exit_layer):
             for _ in range(early_exit_extra_transformer_blocks):
-                self.early_exit_transformer_blocks.append(ModuleList([
-                    CausalAttention(dim = dim, dim_head = dim_head, heads = heads, rotary_emb = rotary_emb),
-                    FeedForward(dim = dim, mult = ff_mult)
-                ]))
+                self.early_exit_transformer_blocks.append(
+                    ModuleList(
+                        [
+                            CausalAttention(
+                                dim=dim,
+                                dim_head=dim_head,
+                                heads=heads,
+                                rotary_emb=rotary_emb,
+                            ),
+                            FeedForward(dim=dim, mult=ff_mult),
+                        ]
+                    )
+                )
 
             self.to_early_exit_logits = nn.Sequential(
-                RMSNorm(dim),
-                nn.Linear(dim, num_tokens, bias = False)
+                RMSNorm(dim), nn.Linear(dim, num_tokens, bias=False)
             )
 
         self.ignore_index = ignore_index
@@ -548,13 +585,13 @@ class Decoder(Module):
     def forward(
         self,
         x,
-        return_loss = False,
-        return_cache = False,
-        seq_start_pos = None,
-        cache = None,
-        early_exit_cache = None,
-        return_early_exit_only = False,
-        start_from_early_exit_hiddens = False
+        return_loss=False,
+        return_cache=False,
+        seq_start_pos=None,
+        cache=None,
+        early_exit_cache=None,
+        return_early_exit_only=False,
+        start_from_early_exit_hiddens=False,
     ):
         if return_loss:
             x, labels = x[:, :-1], x[:, 1:]
@@ -566,7 +603,7 @@ class Decoder(Module):
         self_attn_kv_mask = None
         if exists(seq_start_pos):
             batch, seq_len = x.shape[:2]
-            seq_range = torch.arange(seq_len, device = x.device, dtype = torch.long)
+            seq_range = torch.arange(seq_len, device=x.device, dtype=torch.long)
             self_attn_kv_mask = seq_range >= seq_start_pos[..., None]
 
         # relative positional encoding
@@ -583,7 +620,7 @@ class Decoder(Module):
             cache_kvs, cache_embeds = cache
 
         if exists(cache_kvs):
-            iter_cache_kvs = iter(cache_kvs.unbind(dim = 1))
+            iter_cache_kvs = iter(cache_kvs.unbind(dim=1))
         else:
             iter_cache_kvs = iter([])
 
@@ -601,24 +638,32 @@ class Decoder(Module):
 
             assert cache_embeds_len <= x.shape[-2]
 
-            early_exit_layers, layers = layers[:early_exit_layer_index], layers[early_exit_layer_index:]
+            early_exit_layers, layers = (
+                layers[:early_exit_layer_index],
+                layers[early_exit_layer_index:],
+            )
             x = x[:, cache_embeds_len:]
 
             if exists(early_cache_kvs):
-                iter_early_cache_kvs = iter(early_cache_kvs.unbind(dim = 1))
+                iter_early_cache_kvs = iter(early_cache_kvs.unbind(dim=1))
             else:
                 iter_early_cache_kvs = iter([])
 
             for ind, (attn, ff) in enumerate(early_exit_layers):
                 residual = x
-                attn_out, cached_kv = attn(x, context_mask = self_attn_kv_mask, rotary_emb = rotary_emb, cache = next(iter_early_cache_kvs, None))
+                attn_out, cached_kv = attn(
+                    x,
+                    context_mask=self_attn_kv_mask,
+                    rotary_emb=rotary_emb,
+                    cache=next(iter_early_cache_kvs, None),
+                )
                 x = residual + attn_out
 
                 new_cached_kvs.append(cached_kv)
 
                 x = ff(x) + x
 
-            x = torch.cat((cache_embeds, x), dim = -2)
+            x = torch.cat((cache_embeds, x), dim=-2)
 
         # if cache passed in, just use the last token
 
@@ -634,7 +679,9 @@ class Decoder(Module):
             layer = ind + 1
 
             residual = x
-            attn_out, cached_kv = attn(x, rotary_emb = rotary_emb, cache = next(iter_cache_kvs, None))
+            attn_out, cached_kv = attn(
+                x, rotary_emb=rotary_emb, cache=next(iter_cache_kvs, None)
+            )
             x = residual + attn_out
 
             new_cached_kvs.append(cached_kv)
@@ -647,9 +694,14 @@ class Decoder(Module):
                 if self.detach_early_exit_hiddens:
                     early_exit_hiddens = early_exit_hiddens.detach()
 
-                for early_exit_attn, early_exit_ff in self.early_exit_transformer_blocks:
+                for (
+                    early_exit_attn,
+                    early_exit_ff,
+                ) in self.early_exit_transformer_blocks:
                     residual = x
-                    attn_out, cached_kv = early_exit_attn(x, rotary_emb = rotary_emb, cache = next(iter_cache_kvs, None))
+                    attn_out, cached_kv = early_exit_attn(
+                        x, rotary_emb=rotary_emb, cache=next(iter_cache_kvs, None)
+                    )
                     x = residual + attn_out
 
                     new_cached_kvs.append(cached_kv)
@@ -659,9 +711,11 @@ class Decoder(Module):
                 if return_early_exit_only:
                     break
 
-        new_cached_kvs = torch.stack(new_cached_kvs, dim = 1)
+        new_cached_kvs = torch.stack(new_cached_kvs, dim=1)
 
-        to_logits = self.to_logits if not return_early_exit_only else self.to_early_exit_logits
+        to_logits = (
+            self.to_logits if not return_early_exit_only else self.to_early_exit_logits
+        )
 
         logits = to_logits(x)
 
@@ -670,14 +724,12 @@ class Decoder(Module):
                 return logits
 
             if exists(cache_embeds):
-                x = torch.cat((cache_embeds, x), dim = -2)
+                x = torch.cat((cache_embeds, x), dim=-2)
 
             return logits, Cache(new_cached_kvs, x)
 
         loss = F.cross_entropy(
-            rearrange(logits, 'b n c -> b c n'),
-            labels,
-            ignore_index = self.ignore_index
+            rearrange(logits, "b n c -> b c n"), labels, ignore_index=self.ignore_index
         )
 
         if not exists(self.to_early_exit_logits):
@@ -686,9 +738,9 @@ class Decoder(Module):
         early_exit_logits = self.to_early_exit_logits(early_exit_hiddens)
 
         early_exit_loss = F.cross_entropy(
-            rearrange(early_exit_logits, 'b n c -> b c n'),
+            rearrange(early_exit_logits, "b n c -> b c n"),
             labels,
-            ignore_index = self.ignore_index
+            ignore_index=self.ignore_index,
         )
 
         return loss, early_exit_loss

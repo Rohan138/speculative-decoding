@@ -1,23 +1,19 @@
 import gzip
 import random
-import tqdm
-import numpy as np
 import time
-from functools import wraps, partial
+from functools import partial, wraps
 
+import numpy as np
 import torch
-from torch.optim import Adam
+import tqdm
+from torch.cuda import Event, synchronize
 from torch.nn import functional as F
-from torch.cuda import synchronize, Event
+from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 
-timer = partial(Event, enable_timing = True)
+timer = partial(Event, enable_timing=True)
 
-from speculative_decoding import (
-    Decoder,
-    base_decoding,
-    speculative_decoding
-)
+from speculative_decoding import Decoder, base_decoding, speculative_decoding
 
 # constants
 
@@ -32,20 +28,24 @@ GENERATE_LENGTH = 512
 SEQ_LEN = 512
 GAMMA = 5
 
-DEVICE_STR = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE_STR = "cuda" if torch.cuda.is_available() else "cpu"
 
 # helpers
+
 
 def cycle(loader):
     while True:
         for data in loader:
             yield data
 
+
 def decode_token(token):
     return str(chr(max(32, token)))
 
+
 def decode_tokens(tokens):
     return "".join(list(map(decode_token, tokens)))
+
 
 def benchmark(fn):
     @wraps(fn)
@@ -60,25 +60,19 @@ def benchmark(fn):
         torch.cuda.synchronize()
         elapsed_time_ms = start_event.elapsed_time(end_event)
         return out, elapsed_time_ms
+
     return inner
+
 
 # instantiate transformer
 
 device = torch.device(DEVICE_STR)
 
-model = Decoder(
-    num_tokens = 256,
-    dim = 512,
-    depth = 10
-).to(device)
+model = Decoder(num_tokens=256, dim=512, depth=4).to(device)
 
 # small model
 
-small_model = Decoder(
-    num_tokens = 256,
-    dim = 512,
-    depth = 2
-).to(device)
+small_model = Decoder(num_tokens=256, dim=512, depth=2).to(device)
 
 # prepare enwik8 data
 
@@ -86,6 +80,7 @@ with gzip.open("./data/enwik8.gz") as file:
     data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
     np_train, np_valid = np.split(data, [int(90e6)])
     data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+
 
 class TextSamplerDataset(Dataset):
     def __init__(self, data, seq_len):
@@ -101,6 +96,7 @@ class TextSamplerDataset(Dataset):
     def __len__(self):
         return self.data.size(0) // self.seq_len
 
+
 train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
 val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
 train_loader = cycle(DataLoader(train_dataset, batch_size=BATCH_SIZE))
@@ -108,20 +104,20 @@ val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE))
 
 # optimizer
 
-optim = Adam(model.parameters(), lr = LEARNING_RATE)
-small_optim = Adam(small_model.parameters(), lr = LEARNING_RATE)
+optim = Adam(model.parameters(), lr=LEARNING_RATE)
+small_optim = Adam(small_model.parameters(), lr=LEARNING_RATE)
 
 # training
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
+for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
     model.train()
     small_model.train()
 
     for _ in range(GRAD_ACCUM_EVERY):
         data = next(train_loader)
 
-        loss = model(data, return_loss = True)
-        small_loss = small_model(data, return_loss = True)
+        loss = model(data, return_loss=True)
+        small_loss = small_model(data, return_loss=True)
 
         (loss / GRAD_ACCUM_EVERY).backward()
         (small_loss / GRAD_ACCUM_EVERY).backward()
@@ -143,10 +139,10 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
         with torch.no_grad():
             valid_data = next(val_loader)
 
-            loss = model(valid_data, return_loss = True)
+            loss = model(valid_data, return_loss=True)
             print(f"validation loss: {loss.item():.3f}")
 
-            small_loss = small_model(valid_data, return_loss = True)
+            small_loss = small_model(valid_data, return_loss=True)
             print(f"validation small loss: {small_loss.item():.3f}")
 
     if i % GENERATE_EVERY == 0:
@@ -159,9 +155,13 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         prompt = inp[None, ...]
 
-        sampled, base_decode_elapsed = benchmark(base_decoding)(model, prompt, GENERATE_LENGTH)
+        sampled, base_decode_elapsed = benchmark(base_decoding)(
+            model, prompt, GENERATE_LENGTH
+        )
 
-        (spec_decode_sampled, num_accepted), spec_decode_elapsed = benchmark(speculative_decoding)(model, small_model, prompt, GENERATE_LENGTH, GAMMA)
+        (spec_decode_sampled, num_accepted), spec_decode_elapsed = benchmark(
+            speculative_decoding
+        )(model, small_model, prompt, GENERATE_LENGTH, GAMMA)
 
         base_decode_output = decode_tokens(sampled[0])
         spec_decode_output = decode_tokens(spec_decode_sampled[0])
@@ -169,6 +169,6 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
         print("\nbase decoding:\n\n", base_decode_output, "\n")
         print("\nspec decoding:\n\n", spec_decode_output, "\n")
 
-        print(f'base decoding in: {base_decode_elapsed:.3f}ms\n')
-        print(f'spec decoding in: {spec_decode_elapsed:.3f}ms\n')
-        print(f'average num accepted: {num_accepted:.1f} / {GAMMA}\n')
+        print(f"base decoding in: {base_decode_elapsed:.3f}ms\n")
+        print(f"spec decoding in: {spec_decode_elapsed:.3f}ms\n")
+        print(f"average num accepted: {num_accepted:.1f} / {GAMMA}\n")

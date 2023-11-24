@@ -1,23 +1,22 @@
 import gzip
 import random
-import tqdm
-import numpy as np
 import time
-from functools import wraps, partial
+from functools import partial, wraps
 
+import numpy as np
 import torch
+import tqdm
+from torch.cuda import Event
 from torch.optim import Adam
-from torch.nn import functional as F
-from torch.cuda import synchronize, Event
 from torch.utils.data import DataLoader, Dataset
 
-timer = partial(Event, enable_timing = True)
+timer = partial(Event, enable_timing=True)
 
 from speculative_decoding.speculative_decoding_with_prophet import (
     Decoder,
     ModelWithProphetWrapper,
     base_decoding,
-    speculative_decoding_with_prophet_model
+    speculative_decoding_with_prophet_model,
 )
 
 # constants
@@ -33,20 +32,24 @@ SEQ_LEN = 512
 GAMMA = 5
 TRAIN_PROPHET = True
 
-DEVICE_STR = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE_STR = "cuda" if torch.cuda.is_available() else "cpu"
 
 # helpers
+
 
 def cycle(loader):
     while True:
         for data in loader:
             yield data
 
+
 def decode_token(token):
     return str(chr(max(32, token)))
 
+
 def decode_tokens(tokens):
     return "".join(list(map(decode_token, tokens)))
+
 
 def benchmark(fn):
     @wraps(fn)
@@ -61,30 +64,24 @@ def benchmark(fn):
         torch.cuda.synchronize()
         elapsed_time_ms = start_event.elapsed_time(end_event)
         return out, elapsed_time_ms
+
     return inner
+
 
 # instantiate transformer
 
 device = torch.device(DEVICE_STR)
 
-model = Decoder(
-    num_tokens = 256,
-    dim = 512,
-    depth = 10
-)
+model = Decoder(num_tokens=256, dim=512, depth=10)
 
-prophet = Decoder(
-    num_tokens = 256,
-    dim = 512,
-    depth = 2
-)
+prophet = Decoder(num_tokens=256, dim=512, depth=2)
 
 model_and_prophet = ModelWithProphetWrapper(
     model,
     prophet,
-    prophet_train_length = GAMMA + 2,
-    num_leading_start_tokens = 2,
-    detach_model_embed_for_prophet = False   # train end to end, shouldn't hurt (although benefits is dubious) given ProphetNet paper - of course, trying to get to the bottom of the benefits in spec decoding setting here
+    prophet_train_length=GAMMA + 2,
+    num_leading_start_tokens=2,
+    detach_model_embed_for_prophet=False,  # train end to end, shouldn't hurt (although benefits is dubious) given ProphetNet paper - of course, trying to get to the bottom of the benefits in spec decoding setting here
 ).to(device)
 
 # prepare enwik8 data
@@ -93,6 +90,7 @@ with gzip.open("./data/enwik8.gz") as file:
     data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
     np_train, np_valid = np.split(data, [int(90e6)])
     data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+
 
 class TextSamplerDataset(Dataset):
     def __init__(self, data, seq_len):
@@ -108,6 +106,7 @@ class TextSamplerDataset(Dataset):
     def __len__(self):
         return self.data.size(0) // self.seq_len
 
+
 train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
 val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
 train_loader = cycle(DataLoader(train_dataset, batch_size=BATCH_SIZE))
@@ -116,11 +115,11 @@ train_loader = cycle(DataLoader(train_dataset, batch_size=BATCH_SIZE))
 
 params = model_and_prophet.parameters() if TRAIN_PROPHET else model.parameters()
 
-optim = Adam(params, lr = LEARNING_RATE)
+optim = Adam(params, lr=LEARNING_RATE)
 
 # training
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
+for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
     model_and_prophet.train()
 
     for _ in range(GRAD_ACCUM_EVERY):
@@ -147,9 +146,13 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         prompt = inp[None, ...]
 
-        sampled, base_decode_elapsed = benchmark(base_decoding)(model, prompt, GENERATE_LENGTH)
+        sampled, base_decode_elapsed = benchmark(base_decoding)(
+            model, prompt, GENERATE_LENGTH
+        )
 
-        (spec_decode_sampled, num_accepted), spec_decode_elapsed = benchmark(speculative_decoding_with_prophet_model)(model_and_prophet, prompt, GENERATE_LENGTH, GAMMA)
+        (spec_decode_sampled, num_accepted), spec_decode_elapsed = benchmark(
+            speculative_decoding_with_prophet_model
+        )(model_and_prophet, prompt, GENERATE_LENGTH, GAMMA)
 
         base_decode_output = decode_tokens(sampled[0])
         spec_decode_output = decode_tokens(spec_decode_sampled[0])
@@ -157,6 +160,6 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
         print("\nbase decoding:\n\n", base_decode_output, "\n")
         print("\nspec decoding:\n\n", spec_decode_output, "\n")
 
-        print(f'base decoding in: {base_decode_elapsed:.3f}ms\n')
-        print(f'spec decoding in: {spec_decode_elapsed:.3f}ms\n')
-        print(f'average num accepted: {num_accepted:.1f} / {GAMMA}\n')
+        print(f"base decoding in: {base_decode_elapsed:.3f}ms\n")
+        print(f"spec decoding in: {spec_decode_elapsed:.3f}ms\n")
+        print(f"average num accepted: {num_accepted:.1f} / {GAMMA}\n")
