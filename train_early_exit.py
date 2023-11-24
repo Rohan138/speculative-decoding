@@ -1,13 +1,11 @@
 import gzip
 import random
-import time
 from functools import partial, wraps
 
 import numpy as np
 import torch
 import tqdm
-from torch.cuda import Event, synchronize
-from torch.nn import functional as F
+from torch.cuda import Event
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 

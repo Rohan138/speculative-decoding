@@ -1,6 +1,5 @@
 import gzip
 import random
-import time
 from functools import partial, wraps
 
 import numpy as np
